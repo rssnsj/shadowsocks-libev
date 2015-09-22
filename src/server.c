@@ -109,6 +109,7 @@ int verbose = 0;
 
 static int acl = 0;
 static int mode = TCP_ONLY;
+static int auth = 0;
 
 static int fast_open = 0;
 #ifdef HAVE_SETRLIMIT
@@ -494,6 +495,14 @@ static void server_recv_cb(EV_P_ ev_io *w, int revents)
 
     // handshake and transmit data
     if (server->stage == 5) {
+        if (server->auth
+                && !ss_check_hash(remote->buf, &r, server->hash_buf, &server->hash_idx)) {
+            LOGE("hash error");
+            report_addr(server->fd);
+            close_and_free_server(EV_A_ server);
+            close_and_free_remote(EV_A_ remote);
+            return;
+        }
         int s = send(remote->fd, remote->buf, r, 0);
         if (s == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -518,13 +527,27 @@ static void server_recv_cb(EV_P_ ev_io *w, int revents)
     } else if (server->stage == 0) {
 
         /*
-         * Shadowsocks Protocol:
+         * Shadowsocks TCP Relay Header:
          *
-         *    +------+----------+----------+
-         *    | ATYP | DST.ADDR | DST.PORT |
-         *    +------+----------+----------+
-         *    |  1   | Variable |    2     |
-         *    +------+----------+----------+
+         *    +------+----------+----------+---------------------+
+         *    | ATYP | DST.ADDR | DST.PORT |       Poly1305      |
+         *    +------+----------+----------+---------------------+
+         *    |  1   | Variable |    2     |          16         |
+         *    +------+----------+----------+---------------------+
+         *
+         *    If ATYP & ONETIMEAUTH_FLAG(0x10) == 1, Authentication (Poly1305) and Hash (BLAKE2b) are enabled.
+         *
+         *    The key of Poly1305 is BLAKE2b(IV + KEY) and the input is the whole header.
+         */
+
+        /*
+         * Shadowsocks TCP Request Payload CRC (Optional, no hash check for response's payload):
+         *
+         *    +------+---------+------+---------+------+
+         *    | DATA | BLAKE2b | DATA | BLAKE2b |     ...
+         *    +------+---------+------+---------+------+
+         *    | 128  |    4    | 128  |    4    |     ...
+         *    +------+---------+------+---------+------+
          */
 
         int offset = 0;
@@ -538,7 +561,7 @@ static void server_recv_cb(EV_P_ ev_io *w, int revents)
         memset(&storage, 0, sizeof(struct sockaddr_storage));
 
         // get remote addr and port
-        if (atyp == 1) {
+        if ((atyp & ADDRTYPE_MASK) == 1) {
             // IP V4
             struct sockaddr_in *addr = (struct sockaddr_in *)&storage;
             size_t in_addr_len = sizeof(struct in_addr);
@@ -560,10 +583,10 @@ static void server_recv_cb(EV_P_ ev_io *w, int revents)
             info.ai_protocol = IPPROTO_TCP;
             info.ai_addrlen = sizeof(struct sockaddr_in);
             info.ai_addr = (struct sockaddr *)addr;
-        } else if (atyp == 3) {
+        } else if ((atyp & ADDRTYPE_MASK) == 3) {
             // Domain name
             uint8_t name_len = *(uint8_t *)(server->buf + offset);
-            if (name_len < r && name_len < 255 && name_len > 0) {
+            if (name_len < r) {
                 memcpy(host, server->buf + offset + 1, name_len);
                 offset += name_len + 1;
             } else {
@@ -596,7 +619,7 @@ static void server_recv_cb(EV_P_ ev_io *w, int revents)
             } else {
                 need_query = 1;
             }
-        } else if (atyp == 4) {
+        } else if ((atyp & ADDRTYPE_MASK) == 4) {
             // IP V6
             struct sockaddr_in6 *addr = (struct sockaddr_in6 *)&storage;
             size_t in6_addr_len = sizeof(struct in6_addr);
@@ -639,6 +662,17 @@ static void server_recv_cb(EV_P_ ev_io *w, int revents)
 
         offset += 2;
 
+        if (auth || (atyp & ONETIMEAUTH_FLAG)) {
+            if (ss_onetimeauth_verify(server->buf + offset, server->buf, offset, server->d_ctx)) {
+                LOGE("authentication error %d", atyp);
+                report_addr(server->fd);
+                close_and_free_server(EV_A_ server);
+                return;
+            };
+            offset += ONETIMEAUTH_BYTES;
+            server->auth = 1;
+        }
+
         if (verbose) {
             LOGI("connect to: %s:%d", host, ntohs(port));
         }
@@ -647,6 +681,14 @@ static void server_recv_cb(EV_P_ ev_io *w, int revents)
         if (r > offset) {
             server->buf_len = r - offset;
             server->buf_idx = offset;
+        }
+
+        if (server->auth
+                && !ss_check_hash(server->buf + server->buf_idx, &server->buf_len, server->hash_buf, &server->hash_idx)) {
+            LOGE("hash error");
+            report_addr(server->fd);
+            close_and_free_server(EV_A_ server);
+            return;
         }
 
         if (!need_query) {
@@ -1050,6 +1092,9 @@ static struct server * new_server(int fd, struct listen_ctx *listener)
 
     struct server *server;
     server = malloc(sizeof(struct server));
+
+    memset(server, 0, sizeof(struct server));
+
     server->buf = malloc(BUF_SIZE);
     server->recv_ctx = malloc(sizeof(struct server_ctx));
     server->send_ctx = malloc(sizeof(struct server_ctx));
@@ -1193,7 +1238,7 @@ int main(int argc, char **argv)
 
     USE_TTY();
 
-    while ((c = getopt_long(argc, argv, "f:s:p:l:k:t:m:c:i:d:a:uUv",
+    while ((c = getopt_long(argc, argv, "f:s:p:l:k:t:m:c:i:d:a:uUvA",
                             long_options, &option_index)) != -1) {
         switch (c) {
         case 0:
@@ -1249,6 +1294,9 @@ int main(int argc, char **argv)
             break;
         case 'v':
             verbose = 1;
+            break;
+        case 'A':
+            auth = 1;
             break;
         }
     }
@@ -1337,6 +1385,10 @@ int main(int argc, char **argv)
 #else
         LOGE("tcp fast open is not supported by this environment");
 #endif
+    }
+
+    if (auth) {
+        LOGI("onetime authentication enabled");
     }
 
 #ifdef __MINGW32__

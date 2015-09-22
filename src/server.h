@@ -55,6 +55,11 @@ struct server {
     ssize_t buf_len;
     ssize_t buf_idx;
     char *buf; // server send from, remote recv into
+
+    int auth;
+    ssize_t hash_idx;
+    char hash_buf[HASH_BUF_LEN + HASH_BYTES]; // 2 bytes for HASH16
+
     struct enc_ctx *e_ctx;
     struct enc_ctx *d_ctx;
     struct server_ctx *recv_ctx;
