@@ -185,7 +185,7 @@ static void server_recv_cb(EV_P_ ev_io *w, int revents)
     }
 
     if (auth) {
-        remote->buf = ss_gen_hash(remote->buf, &r, remote->hash_buf, &remote->hash_idx, BUF_SIZE);
+        remote->buf = ss_gen_hash(remote->buf, &r, &remote->counter, server->e_ctx, BUF_SIZE);
     }
 
     remote->buf = ss_encrypt(BUF_SIZE, remote->buf, &r, server->e_ctx);
@@ -377,7 +377,7 @@ static void remote_send_cb(EV_P_ ev_io *w, int revents)
 
             if (auth) {
                 ss_addr_to_send[0] |= ONETIMEAUTH_FLAG;
-                ss_onetimeauth(ss_addr_to_send + addr_len, ss_addr_to_send, addr_len, server->e_ctx);
+                ss_onetimeauth(ss_addr_to_send + addr_len, ss_addr_to_send, addr_len, server->e_ctx->evp.iv);
                 addr_len += ONETIMEAUTH_BYTES;
             }
 
@@ -719,6 +719,9 @@ int main(int argc, char **argv)
         if (timeout == NULL) {
             timeout = conf->timeout;
         }
+        if (auth == 0) {
+            auth = conf->auth;
+        }
     }
 
     if (remote_num == 0 || remote_port == NULL ||
@@ -794,7 +797,7 @@ int main(int argc, char **argv)
     if (mode != TCP_ONLY) {
         LOGI("UDP relay enabled");
         init_udprelay(local_addr, local_port, listen_ctx.remote_addr[0],
-                      get_sockaddr_len(listen_ctx.remote_addr[0]), m, listen_ctx.timeout, NULL);
+                      get_sockaddr_len(listen_ctx.remote_addr[0]), m, auth, listen_ctx.timeout, NULL);
     }
 
     if (mode == UDP_ONLY) {

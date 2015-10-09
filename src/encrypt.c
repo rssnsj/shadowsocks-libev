@@ -30,6 +30,7 @@
 
 #include <openssl/md5.h>
 #include <openssl/rand.h>
+#include <openssl/hmac.h>
 
 #elif defined(USE_CRYPTO_POLARSSL)
 
@@ -71,6 +72,7 @@
 #include <arpa/inet.h>
 #endif
 
+#include "hmac-sha1.h"
 #include "cache.h"
 #include "encrypt.h"
 #include "utils.h"
@@ -1028,29 +1030,41 @@ static int cipher_context_update(cipher_ctx_t *ctx, uint8_t *output, size_t *ole
 #endif
 }
 
-int ss_onetimeauth(char *auth, char *msg, int msg_len, struct enc_ctx *ctx)
+int ss_onetimeauth(char *auth, char *msg, int msg_len, uint8_t *iv)
 {
-    uint8_t auth_key[ONETIMEAUTH_KEYBYTES];
-    uint8_t auth_bytes[MAX_IV_LENGTH + MAX_KEY_LENGTH];
-    memcpy(auth_bytes, ctx->evp.iv, enc_iv_len);
-    memcpy(auth_bytes + enc_iv_len, enc_key, enc_key_len);
-    crypto_generichash(auth_key, ONETIMEAUTH_KEYBYTES, auth_bytes, enc_iv_len + enc_key_len, NULL, 0);
+    uint8_t hash[ONETIMEAUTH_BYTES * 2];
+    uint8_t auth_key[MAX_IV_LENGTH + MAX_KEY_LENGTH];
+    memcpy(auth_key, iv, enc_iv_len);
+    memcpy(auth_key + enc_iv_len, enc_key, enc_key_len);
 
-    return crypto_onetimeauth((uint8_t *)auth, (uint8_t *)msg, msg_len, auth_key);
+#if defined(USE_CRYPTO_OPENSSL)
+    HMAC(EVP_sha1(), auth_key, enc_iv_len + enc_key_len, (uint8_t *)msg, msg_len, (uint8_t *)hash, NULL);
+#else
+    ss_sha1_hmac(auth_key, enc_iv_len + enc_key_len, (uint8_t *)msg, msg_len, (uint8_t *)hash);
+#endif
+
+    memcpy(auth, hash, ONETIMEAUTH_BYTES);
+
+    return 0;
 }
 
-int ss_onetimeauth_verify(char *auth, char *msg, int msg_len, struct enc_ctx *ctx)
+int ss_onetimeauth_verify(char *auth, char *msg, int msg_len, uint8_t *iv)
 {
-    uint8_t auth_key[ONETIMEAUTH_KEYBYTES];
-    uint8_t auth_bytes[MAX_IV_LENGTH + MAX_KEY_LENGTH];
-    memcpy(auth_bytes, ctx->evp.iv, enc_iv_len);
-    memcpy(auth_bytes + enc_iv_len, enc_key, enc_key_len);
-    crypto_generichash(auth_key, ONETIMEAUTH_KEYBYTES, auth_bytes, enc_iv_len + enc_key_len, NULL, 0);
+    uint8_t hash[ONETIMEAUTH_BYTES * 2];
+    uint8_t auth_key[MAX_IV_LENGTH + MAX_KEY_LENGTH];
+    memcpy(auth_key, iv, enc_iv_len);
+    memcpy(auth_key + enc_iv_len, enc_key, enc_key_len);
 
-    return crypto_onetimeauth_verify((uint8_t *)auth, (uint8_t *)msg, msg_len, auth_key);
+#if defined(USE_CRYPTO_OPENSSL)
+    HMAC(EVP_sha1(), auth_key, enc_iv_len + enc_key_len, (uint8_t *)msg, msg_len, hash, NULL);
+#else
+    ss_sha1_hmac(auth_key, enc_iv_len + enc_key_len, (uint8_t *)msg, msg_len, hash);
+#endif
+
+    return memcmp(auth, hash, ONETIMEAUTH_BYTES);
 }
 
-char * ss_encrypt_all(int buf_size, char *plaintext, ssize_t *len, int method)
+char * ss_encrypt_all(int buf_size, char *plaintext, ssize_t *len, int method, int auth)
 {
     if (method > TABLE) {
         cipher_ctx_t evp;
@@ -1070,9 +1084,20 @@ char * ss_encrypt_all(int buf_size, char *plaintext, ssize_t *len, int method)
         char *ciphertext = tmp_buf;
 
         uint8_t iv[MAX_IV_LENGTH];
+
         rand_bytes(iv, iv_len);
         cipher_context_set_iv(&evp, iv, iv_len, 1);
         memcpy(ciphertext, iv, iv_len);
+
+        if (auth) {
+            char hash[ONETIMEAUTH_BYTES * 2];
+            ss_onetimeauth(hash, plaintext, p_len, iv);
+            if (buf_size < ONETIMEAUTH_BYTES + p_len) {
+                plaintext = realloc(plaintext, ONETIMEAUTH_BYTES + p_len);
+            }
+            memcpy(plaintext + p_len, hash, ONETIMEAUTH_BYTES);
+            p_len = c_len = p_len + ONETIMEAUTH_BYTES;
+        }
 
         if (method >= SALSA20) {
             crypto_stream_xor_ic((uint8_t *)(ciphertext + iv_len),
@@ -1098,8 +1123,8 @@ char * ss_encrypt_all(int buf_size, char *plaintext, ssize_t *len, int method)
 
         cipher_context_release(&evp);
 
-        if (*len < iv_len + c_len) {
-            plaintext = realloc(plaintext, max(iv_len + c_len, buf_size));
+        if (buf_size < iv_len + c_len) {
+            plaintext = realloc(plaintext, iv_len + c_len);
         }
         *len = iv_len + c_len;
         memcpy(plaintext, ciphertext, *len);
@@ -1184,8 +1209,8 @@ char * ss_encrypt(int buf_size, char *plaintext, ssize_t *len,
         dump("CIPHER", ciphertext + iv_len, c_len);
 #endif
 
-        if (*len < iv_len + c_len) {
-            plaintext = realloc(plaintext, max(iv_len + c_len, buf_size));
+        if (buf_size < iv_len + c_len) {
+            plaintext = realloc(plaintext, iv_len + c_len);
         }
         *len = iv_len + c_len;
         memcpy(plaintext, ciphertext, *len);
@@ -1201,14 +1226,14 @@ char * ss_encrypt(int buf_size, char *plaintext, ssize_t *len,
     }
 }
 
-char * ss_decrypt_all(int buf_size, char *ciphertext, ssize_t *len, int method)
+char * ss_decrypt_all(int buf_size, char *ciphertext, ssize_t *len, int method, int auth)
 {
     if (method > TABLE) {
         cipher_ctx_t evp;
         cipher_context_init(&evp, method, 0);
         size_t iv_len = enc_iv_len;
         size_t c_len = *len, p_len = *len - iv_len;
-        int err = 1;
+        int ret = 1;
 
         static int tmp_len = 0;
         static char *tmp_buf = NULL;
@@ -1229,12 +1254,19 @@ char * ss_decrypt_all(int buf_size, char *ciphertext, ssize_t *len, int method)
                                  (uint64_t)(c_len - iv_len),
                                  (const uint8_t *)iv, 0, enc_key, method);
         } else {
-            err = cipher_context_update(&evp, (uint8_t *)plaintext, &p_len,
+            ret = cipher_context_update(&evp, (uint8_t *)plaintext, &p_len,
                                         (const uint8_t *)(ciphertext + iv_len),
                                         c_len - iv_len);
         }
 
-        if (!err) {
+        if (auth || (plaintext[0] & ONETIMEAUTH_FLAG)) {
+            char hash[ONETIMEAUTH_BYTES];
+            memcpy(hash, plaintext + p_len - ONETIMEAUTH_BYTES, ONETIMEAUTH_BYTES);
+            ret = !ss_onetimeauth_verify(hash, plaintext, p_len - ONETIMEAUTH_BYTES, iv);
+            if (ret) p_len -= ONETIMEAUTH_BYTES;
+        }
+
+        if (!ret) {
             free(ciphertext);
             cipher_context_release(&evp);
             return NULL;
@@ -1247,8 +1279,8 @@ char * ss_decrypt_all(int buf_size, char *ciphertext, ssize_t *len, int method)
 
         cipher_context_release(&evp);
 
-        if (*len < p_len) {
-            ciphertext = realloc(ciphertext, max(p_len, buf_size));
+        if (buf_size < p_len) {
+            ciphertext = realloc(ciphertext, p_len);
         }
         *len = p_len;
         memcpy(ciphertext, plaintext, *len);
@@ -1309,8 +1341,7 @@ char * ss_decrypt(int buf_size, char *ciphertext, ssize_t *len, struct enc_ctx *
                 tmp_buf = plaintext;
             }
             if (padding) {
-                ciphertext =
-                    realloc(ciphertext, max(c_len + padding, buf_size));
+                ciphertext = realloc(ciphertext, max(c_len + padding, buf_size));
                 memmove(ciphertext + iv_len + padding, ciphertext + iv_len,
                         c_len - iv_len);
                 memset(ciphertext + iv_len, 0, padding);
@@ -1341,8 +1372,8 @@ char * ss_decrypt(int buf_size, char *ciphertext, ssize_t *len, struct enc_ctx *
         dump("CIPHER", ciphertext + iv_len, c_len - iv_len);
 #endif
 
-        if (*len < p_len) {
-            ciphertext = realloc(ciphertext, max(p_len, buf_size));
+        if (buf_size < p_len) {
+            ciphertext = realloc(ciphertext, p_len);
         }
         *len = p_len;
         memcpy(ciphertext, plaintext, *len);
@@ -1478,53 +1509,102 @@ int enc_init(const char *pass, const char *method)
     return m;
 }
 
-int ss_check_hash(char *buf, ssize_t *buf_len, char *hash_buf, ssize_t *hash_idx)
+int ss_check_hash(char **buf_ptr, ssize_t *buf_len, struct chunk *chunk, struct enc_ctx *ctx, int buf_size)
 {
-    int i, j;
+    int i, j, k;
+    char *buf = *buf_ptr;
     ssize_t blen = *buf_len;
-    ssize_t cidx = *hash_idx;
+    uint32_t cidx = chunk->idx;
 
-    for (i = 0, j = 0; i < blen; i++) {
-        if (cidx < HASH_BUF_LEN) {
-            buf[j] = buf[i];
-            j++;
+    if (chunk->buf == NULL) {
+        chunk->buf = (char *)malloc(buf_size);
+        chunk->len = buf_size - AUTH_BYTES;
+    }
+
+    int size = max(chunk->len + blen, buf_size);
+    if (buf_size < size) {
+        buf = realloc(buf, size);
+    }
+
+    for (i = 0, j = 0, k = 0; i < blen; i++) {
+
+        chunk->buf[cidx++] = buf[k++];
+
+        if (cidx == CLEN_BYTES) {
+            uint16_t clen = ntohs(*((uint16_t *)chunk->buf));
+
+            if (buf_size < clen + AUTH_BYTES) {
+                chunk->buf = realloc(chunk->buf, clen + AUTH_BYTES);
+            }
+            chunk->len = clen;
         }
-        hash_buf[cidx] = buf[i];
-        cidx++;
-        if (cidx == HASH_BUF_LEN + HASH_BYTES) {
-            uint8_t hash[HASH_BYTES];
-            crypto_generichash(hash, HASH_BYTES, (uint8_t *)hash_buf, HASH_BUF_LEN, NULL, 0);
-            if (memcmp(hash, hash_buf + HASH_BUF_LEN, HASH_BYTES) != 0) return 0;
+
+        if (cidx == chunk->len + AUTH_BYTES) {
+            // Compare hash
+            uint8_t hash[ONETIMEAUTH_BYTES * 2];
+            uint8_t key[MAX_IV_LENGTH + sizeof(uint32_t)];
+
+            uint32_t c = htonl(chunk->counter);
+            memcpy(key, ctx->evp.iv, enc_iv_len);
+            memcpy(key + enc_iv_len, &c, sizeof(uint32_t));
+#if defined(USE_CRYPTO_OPENSSL)
+            HMAC(EVP_sha1(), key, enc_iv_len + sizeof(uint32_t),
+                    (uint8_t *)chunk->buf + AUTH_BYTES, chunk->len, hash, NULL);
+#else
+            ss_sha1_hmac(key, enc_iv_len + sizeof(uint32_t),
+                    (uint8_t *)chunk->buf + AUTH_BYTES, chunk->len, hash);
+#endif
+
+            if (memcmp(hash, chunk->buf + CLEN_BYTES, ONETIMEAUTH_BYTES) != 0) {
+                *buf_ptr = buf;
+                return 0;
+            }
+
+            // Copy chunk back to buffer
+            memmove(buf + j + chunk->len, buf + k, blen - i - 1);
+            memcpy(buf + j, chunk->buf + AUTH_BYTES, chunk->len);
+
+            // Reset the base offset
+            j += chunk->len;
+            k = j;
             cidx = 0;
+            chunk->counter++;
         }
     }
+
+    *buf_ptr = buf;
     *buf_len = j;
-    *hash_idx = cidx;
+    chunk->idx = cidx;
     return 1;
 }
 
-char *ss_gen_hash(char *buf, ssize_t *buf_len, char *hash_buf, ssize_t *hash_idx, int buf_size)
+char *ss_gen_hash(char *buf, ssize_t *buf_len, uint32_t *counter, struct enc_ctx *ctx, int buf_size)
 {
-    int i, j;
     ssize_t blen = *buf_len;
-    ssize_t cidx = *hash_idx;
-    int size = max((blen / HASH_BUF_LEN + 1) * HASH_BYTES + blen, buf_size);
+    int size = max(AUTH_BYTES + blen, buf_size);
 
     if (buf_size < size) {
         buf = realloc(buf, size);
     }
-    for (i = 0, j = 0; i < blen; i++, j++) {
-        if (cidx == HASH_BUF_LEN) {
-            uint8_t hash[HASH_BYTES];
-            crypto_generichash(hash, HASH_BYTES, (uint8_t *)hash_buf, HASH_BUF_LEN, NULL, 0);
-            memmove(buf + j + HASH_BYTES, buf + j, blen - i);
-            memcpy(buf + j, hash, HASH_BYTES);
-            j += HASH_BYTES; cidx = 0;
-        }
-        hash_buf[cidx] = buf[j];
-        cidx++;
-    }
-    *buf_len = j;
-    *hash_idx = cidx;
+
+    uint16_t chunk_len = htons((uint16_t)blen);
+    uint8_t hash[ONETIMEAUTH_BYTES * 2];
+    uint8_t key[MAX_IV_LENGTH + sizeof(uint32_t)];
+
+    uint32_t c = htonl(*counter);
+    memcpy(key, ctx->evp.iv, enc_iv_len);
+    memcpy(key + enc_iv_len, &c, sizeof(uint32_t));
+#if defined(USE_CRYPTO_OPENSSL)
+    HMAC(EVP_sha1(), key, enc_iv_len + sizeof(uint32_t), (uint8_t *)buf, blen, hash, NULL);
+#else
+    ss_sha1_hmac(key, enc_iv_len + sizeof(uint32_t), (uint8_t *)buf, blen, hash);
+#endif
+
+    memmove(buf + AUTH_BYTES, buf, blen);
+    memcpy(buf + CLEN_BYTES, hash, ONETIMEAUTH_BYTES);
+    memcpy(buf, &chunk_len, CLEN_BYTES);
+
+    *counter = *counter + 1;
+    *buf_len = blen + AUTH_BYTES;
     return buf;
 }
